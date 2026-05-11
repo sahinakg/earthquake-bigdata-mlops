@@ -1,0 +1,258 @@
+name: earthquake-bigdata-mlops
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: earthquake-kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      KAFKA_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://kafka:29093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+    networks:
+      - earthquake-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: earthquake-kafka-ui
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: "local-earthquake-cluster"
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:29092"
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - earthquake-net
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    image: earthquake-spark:3.5.1
+    container_name: earthquake-spark-master
+    hostname: spark-master
+    user: root
+    working_dir: /app
+    command: spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    environment:
+      PYTHONPATH: /app
+      PROJECT_ROOT: /app
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:29092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-earthquake-events}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./:/app
+      - spark-ivy-cache:/root/.ivy2
+      - spark-m2-cache:/root/.m2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - earthquake-net
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    image: earthquake-spark:3.5.1
+    container_name: earthquake-spark-worker
+    hostname: spark-worker
+    user: root
+    working_dir: /app
+    command: spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-3G}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      PYTHONPATH: /app
+      PROJECT_ROOT: /app
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:29092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-earthquake-events}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./:/app
+      - spark-ivy-cache:/root/.ivy2
+      - spark-m2-cache:/root/.m2
+    depends_on:
+      - spark-master
+    networks:
+      - earthquake-net
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: earthquake-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mlflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
+      POSTGRES_DB: ${POSTGRES_DB:-mlflow}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-mlflow} -d $${POSTGRES_DB:-mlflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - earthquake-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: earthquake-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    networks:
+      - earthquake-net
+
+  minio-create-bucket:
+    image: minio/mc:latest
+    container_name: earthquake-minio-create-bucket
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin}; do sleep 2; done;
+      /usr/bin/mc mb -p local/mlflow-artifacts || true;
+      /usr/bin/mc anonymous set none local/mlflow-artifacts || true;
+      exit 0;
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    networks:
+      - earthquake-net
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    image: earthquake-mlflow:2.14.1
+    container_name: earthquake-mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: ${MLFLOW_S3_ENDPOINT_URL:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      AWS_DEFAULT_REGION: us-east-1
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlflow}:${POSTGRES_PASSWORD:-mlflow}@postgres:5432/${POSTGRES_DB:-mlflow}
+      --default-artifact-root mlflow-artifacts:/
+      --artifacts-destination s3://mlflow-artifacts
+      --serve-artifacts
+      --host 0.0.0.0
+      --port 5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-create-bucket:
+        condition: service_completed_successfully
+    networks:
+      - earthquake-net
+
+  producer:
+    build:
+      context: .
+      dockerfile: docker/producer/Dockerfile
+    image: earthquake-producer:1.0.0
+    container_name: earthquake-producer
+    working_dir: /app
+    profiles: ["streaming"]
+    environment:
+      PYTHONPATH: /app
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:29092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-earthquake-events}
+      CSV_PATH: ${CSV_PATH:-/app/data/raw/Eartquakes-1990-2023.csv}
+      PRODUCER_SLEEP_SECONDS: ${PRODUCER_SLEEP_SECONDS:-0.05}
+      PRODUCER_MAX_ROWS: ${PRODUCER_MAX_ROWS:-1000}
+      PRODUCER_LOOP: ${PRODUCER_LOOP:-false}
+      PRODUCER_KEY_FIELD: ${PRODUCER_KEY_FIELD:-state}
+      PRODUCER_LOG_EVERY: ${PRODUCER_LOG_EVERY:-1000}
+    volumes:
+      - ./:/app
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - earthquake-net
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: docker/jupyter/Dockerfile
+    image: earthquake-jupyter:1.0.0
+    container_name: earthquake-jupyter
+    working_dir: /app
+    ports:
+      - "8888:8888"
+    environment:
+      PYTHONPATH: /app
+      PROJECT_ROOT: /app
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+    command: >
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --allow-root
+      --ServerApp.token=''
+      --ServerApp.password=''
+    volumes:
+      - ./:/app
+    depends_on:
+      - spark-master
+      - mlflow
+    networks:
+      - earthquake-net
+
+networks:
+  earthquake-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  minio-data:
+  spark-ivy-cache:
+  spark-m2-cache:
